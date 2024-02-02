@@ -161,7 +161,7 @@ impl Seek for StreamWriter {
 }
 
 const MINIMUM_READ_LENGTH: u64 = 1024 * 1024;
-const PREFETCH_READ_LENGTH: u64 = 1024 * 1024;
+const PREFETCH_READ_LENGTH: u64 = 1024 * 256;
 
 impl Read for StreamReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
