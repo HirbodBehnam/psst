@@ -10,23 +10,23 @@ use crate::{
     error::Error,
     item_id::FileId,
     session::{access_token::TokenProvider, SessionService},
-    util::default_ureq_agent_builder,
+    util::default_reqwest_client_builder,
 };
 
 pub type CdnHandle = Arc<Cdn>;
 
 pub struct Cdn {
     session: SessionService,
-    agent: ureq::Agent,
+    http_client: reqwest::blocking::Client,
     token_provider: TokenProvider,
 }
 
 impl Cdn {
     pub fn new(session: SessionService, proxy_url: Option<&str>) -> Result<CdnHandle, Error> {
-        let agent = default_ureq_agent_builder(proxy_url)?.build();
+        let http_client = default_reqwest_client_builder(proxy_url)?.build()?;
         Ok(Arc::new(Self {
             session,
-            agent,
+            http_client,
             token_provider: TokenProvider::new(),
         }))
     }
@@ -38,14 +38,14 @@ impl Cdn {
         );
         let access_token = self.token_provider.get(&self.session)?;
         let response = self
-            .agent
+            .http_client
             .get(&locations_uri)
-            .query("version", "10000000")
-            .query("product", "9")
-            .query("platform", "39")
-            .query("alt", "json")
-            .set("Authorization", &format!("Bearer {}", access_token.token))
-            .call()?;
+            .query(&[("version", "10000000")])
+            .query(&[("product", "9")])
+            .query(&[("platform", "39")])
+            .query(&[("alt", "json")])
+            .header("Authorization", &format!("Bearer {}", access_token.token))
+            .send()?;
 
         #[derive(Deserialize)]
         struct AudioFileLocations {
@@ -53,7 +53,7 @@ impl Cdn {
         }
 
         // Deserialize the response and pick a file URL from the returned CDN list.
-        let locations: AudioFileLocations = response.into_json()?;
+        let locations: AudioFileLocations = response.json()?;
         let file_uri = locations
             .cdnurl
             .into_iter()
@@ -75,13 +75,12 @@ impl Cdn {
         length: u64,
     ) -> Result<(u64, impl Read), Error> {
         let response = self
-            .agent
+            .http_client
             .get(uri)
-            .set("Range", &range_header(offset, length))
-            .call()?;
+            .header("Range", &range_header(offset, length))
+            .send()?;
         let total_length = parse_total_content_length(&response);
-        let data_reader = response.into_reader();
-        Ok((total_length, data_reader))
+        Ok((total_length, response))
     }
 }
 
@@ -112,8 +111,8 @@ impl CdnUrl {
     }
 }
 
-impl From<ureq::Error> for Error {
-    fn from(err: ureq::Error) -> Self {
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
         Error::AudioFetchingError(Box::new(err))
     }
 }
@@ -128,10 +127,13 @@ fn range_header(offfset: u64, length: u64) -> String {
 ///
 /// For example, returns 146515 for a response with header
 /// "Content-Range: bytes 0-1023/146515".
-fn parse_total_content_length(response: &ureq::Response) -> u64 {
+fn parse_total_content_length(response: &reqwest::blocking::Response) -> u64 {
     response
-        .header("Content-Range")
+        .headers()
+        .get("Content-Range")
         .expect("Content-Range header not found")
+        .to_str()
+        .expect("cannot convert header to str")
         .split('/')
         .last()
         .expect("Failed to parse Content-Range Header")

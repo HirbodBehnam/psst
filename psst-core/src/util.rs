@@ -9,13 +9,11 @@ pub const NET_CONNECT_TIMEOUT: Duration = Duration::from_millis(8 * 1000);
 
 pub const NET_IO_TIMEOUT: Duration = Duration::from_millis(16 * 1000);
 
-pub fn default_ureq_agent_builder(proxy_url: Option<&str>) -> Result<ureq::AgentBuilder, Error> {
-    let builder = ureq::AgentBuilder::new()
-        .timeout_connect(NET_CONNECT_TIMEOUT)
-        .timeout_read(NET_IO_TIMEOUT)
-        .timeout_write(NET_IO_TIMEOUT);
+pub fn default_reqwest_client_builder(proxy_url: Option<&str>) -> Result<reqwest::blocking::ClientBuilder, Error> {
+    let builder = reqwest::blocking::ClientBuilder::new()
+        .timeout(NET_CONNECT_TIMEOUT);
     if let Some(url) = proxy_url {
-        let proxy = ureq::Proxy::new(url)?;
+        let proxy = reqwest::Proxy::all(url)?;
         Ok(builder.proxy(proxy))
     } else {
         Ok(builder)

@@ -1,10 +1,5 @@
 use std::{
-    fmt::Display,
-    io::{self, Read},
-    path::PathBuf,
-    sync::Arc,
-    thread,
-    time::Duration,
+    fmt::Display, io, path::PathBuf, sync::Arc, thread, time::Duration
 };
 
 use druid::{
@@ -12,16 +7,17 @@ use druid::{
     image::{self, ImageFormat},
     Data, ImageBuf,
 };
+use druid_shell::piet::TextStorage;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
-use ureq::{Agent, Request, Response};
+use reqwest::{blocking::{Client, RequestBuilder, Response}, Method};
 
 use psst_core::{
     session::{access_token::TokenProvider, SessionService},
-    util::default_ureq_agent_builder,
+    util::default_reqwest_client_builder,
 };
 
 use crate::{
@@ -37,7 +33,7 @@ use super::{cache::WebApiCache, local::LocalTrackManager};
 
 pub struct WebApi {
     session: SessionService,
-    agent: Agent,
+    http_client: Client,
     cache: WebApiCache,
     token_provider: TokenProvider,
     local_track_manager: Mutex<LocalTrackManager>,
@@ -51,10 +47,10 @@ impl WebApi {
         cache_base: Option<PathBuf>,
         paginated_limit: usize,
     ) -> Self {
-        let agent = default_ureq_agent_builder(proxy_url).unwrap().build();
+        let http_client = default_reqwest_client_builder(proxy_url).unwrap().build().unwrap();
         Self {
             session,
-            agent,
+            http_client,
             cache: WebApiCache::new(cache_base),
             token_provider: TokenProvider::new(),
             local_track_manager: Mutex::new(LocalTrackManager::new()),
@@ -70,38 +66,40 @@ impl WebApi {
         Ok(token.token)
     }
 
-    fn request(&self, method: &str, path: impl Display) -> Result<Request, Error> {
+    fn request(&self, method: Method, path: impl Display) -> Result<RequestBuilder, Error> {
         let token = self.access_token()?;
         let request = self
-            .agent
+            .http_client
             .request(method, &format!("https://api.spotify.com/{}", path))
-            .set("Authorization", &format!("Bearer {}", &token));
+            .header("Authorization", &format!("Bearer {}", &token));
         Ok(request)
     }
 
-    fn get(&self, path: impl Display) -> Result<Request, Error> {
-        self.request("GET", path)
+    fn get(&self, path: impl Display) -> Result<RequestBuilder, Error> {
+        self.request(Method::GET, path)
     }
 
-    fn put(&self, path: impl Display) -> Result<Request, Error> {
-        self.request("PUT", path)
+    fn put(&self, path: impl Display) -> Result<RequestBuilder, Error> {
+        self.request(Method::PUT, path)
     }
 
-    fn post(&self, path: impl Display) -> Result<Request, Error> {
-        self.request("POST", path)
+    fn post(&self, path: impl Display) -> Result<RequestBuilder, Error> {
+        self.request(Method::POST, path)
     }
 
-    fn delete(&self, path: impl Display) -> Result<Request, Error> {
-        self.request("DELETE", path)
+    fn delete(&self, path: impl Display) -> Result<RequestBuilder, Error> {
+        self.request(Method::DELETE, path)
     }
 
     fn with_retry(f: impl Fn() -> Result<Response, Error>) -> Result<Response, Error> {
         loop {
             let response = f()?;
-            match response.status() {
+            match response.status().as_u16() {
                 429 => {
                     let retry_after_secs = response
-                        .header("Retry-After")
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|secs| secs.to_str().ok())
                         .and_then(|secs| secs.parse().ok())
                         .unwrap_or(2);
                     thread::sleep(Duration::from_secs(retry_after_secs));
@@ -115,16 +113,17 @@ impl WebApi {
 
     /// Send a request with a empty JSON object, throw away the response body.
     /// Use for POST/PUT/DELETE requests.
-    fn send_empty_json(&self, request: Request) -> Result<(), Error> {
-        let _response = Self::with_retry(|| Ok(request.clone().send_string("{}")?))?;
+    fn send_empty_json(&self, request: RequestBuilder) -> Result<(), Error> {
+        let request = request.body("{}");
+        let _response = Self::with_retry(|| Ok(request.try_clone().unwrap().send()?))?;
         Ok(())
     }
 
     /// Send a request and return the deserialized JSON body.  Use for GET
     /// requests.
-    fn load<T: DeserializeOwned>(&self, request: Request) -> Result<T, Error> {
-        let response = Self::with_retry(|| Ok(request.clone().call()?))?;
-        let result = response.into_json()?;
+    fn load<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Error> {
+        let response = Self::with_retry(|| Ok(request.try_clone().unwrap().send()?))?;
+        let result = response.json()?;
         Ok(result)
     }
 
@@ -132,7 +131,7 @@ impl WebApi {
     /// in cache.
     fn load_cached<T: Data + DeserializeOwned>(
         &self,
-        request: Request,
+        request: RequestBuilder,
         bucket: &str,
         key: &str,
     ) -> Result<Cached<T>, Error> {
@@ -141,15 +140,10 @@ impl WebApi {
             let value = serde_json::from_reader(file)?;
             Ok(Cached::new(value, cached_at))
         } else {
-            let response = Self::with_retry(|| Ok(request.clone().call()?))?;
-            let body = {
-                let mut reader = response.into_reader();
-                let mut body = Vec::new();
-                reader.read_to_end(&mut body)?;
-                body
-            };
-            let value = serde_json::from_slice(&body)?;
-            self.cache.set(bucket, key, &body);
+            let response = Self::with_retry(|| Ok(request.try_clone().unwrap().send()?))?;
+            let body = response.text()?;
+            let value = serde_json::from_str(&body)?;
+            self.cache.set(bucket, key, &body.as_bytes());
             Ok(Cached::fresh(value))
         }
     }
@@ -158,7 +152,7 @@ impl WebApi {
     /// pagination parameters.  Mostly used through `load_all_pages`.
     fn for_all_pages<T: DeserializeOwned + Clone>(
         &self,
-        request: Request,
+        request: RequestBuilder,
         mut func: impl FnMut(Page<T>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         // TODO: Some result sets, like very long playlists and saved tracks/albums can
@@ -167,9 +161,10 @@ impl WebApi {
         let mut offset = 0;
         loop {
             let req = request
-                .clone()
-                .query("limit", &limit.to_string())
-                .query("offset", &offset.to_string());
+                .try_clone()
+                .unwrap()
+                .query(&[("limit", &limit.to_string())])
+                .query(&[("offset", &offset.to_string())]);
             let page: Page<T> = self.load(req)?;
 
             let page_total = page.total;
@@ -191,7 +186,7 @@ impl WebApi {
     /// parameters and return the aggregated results.  Use with GET requests.
     fn load_all_pages<T: DeserializeOwned + Clone>(
         &self,
-        request: Request,
+        request: RequestBuilder,
     ) -> Result<Vector<T>, Error> {
         let mut results = Vector::new();
 
@@ -253,7 +248,7 @@ impl WebApi {
     pub fn get_artist_albums(&self, id: &str) -> Result<ArtistAlbums, Error> {
         let request = self
             .get(format!("v1/artists/{}/albums", id))?
-            .query("market", "from_token");
+            .query(&[("market", "from_token")]);
         let result: Vector<Arc<Album>> = self.load_all_pages(request)?;
 
         let mut artist_albums = ArtistAlbums {
@@ -304,7 +299,7 @@ impl WebApi {
 
         let request = self
             .get(format!("v1/artists/{}/top-tracks", id))?
-            .query("market", "from_token");
+            .query(&[("market", "from_token")]);
         let result: Tracks = self.load(request)?;
         Ok(result.tracks)
     }
@@ -328,7 +323,7 @@ impl WebApi {
     pub fn get_album(&self, id: &str) -> Result<Cached<Arc<Album>>, Error> {
         let request = self
             .get(format!("v1/albums/{}", id))?
-            .query("market", "from_token");
+            .query(&[("market", "from_token")]);
         let result = self.load_cached(request, "album", id)?;
         Ok(result)
     }
@@ -348,8 +343,8 @@ impl WebApi {
 
         let request = self
             .get("v1/episodes")?
-            .query("ids", &ids.into_iter().map(|id| id.0.to_base62()).join(","))
-            .query("market", "from_token");
+            .query(&[("ids", &ids.into_iter().map(|id| id.0.to_base62()).join(","))])
+            .query(&[("market", "from_token")]);
         let result: Episodes = self.load(request)?;
         Ok(result.episodes)
     }
@@ -358,7 +353,7 @@ impl WebApi {
     pub fn get_show_episodes(&self, id: &str) -> Result<Vector<Arc<Episode>>, Error> {
         let request = self
             .get(format!("v1/shows/{}/episodes", id))?
-            .query("market", "from_token");
+            .query(&[("market", "from_token")]);
         let mut results = Vector::new();
 
         self.for_all_pages(request, |page: Page<EpisodeLink>| {
@@ -380,7 +375,7 @@ impl WebApi {
     pub fn get_track(&self, id: &str) -> Result<Arc<Track>, Error> {
         let request = self
             .get(format!("v1/tracks/{}", id))?
-            .query("market", "from_token");
+            .query(&[("market", "from_token")]);
         let result = self.load(request)?;
         Ok(result)
     }
@@ -395,7 +390,7 @@ impl WebApi {
             album: Arc<Album>,
         }
 
-        let request = self.get("v1/me/albums")?.query("market", "from_token");
+        let request = self.get("v1/me/albums")?.query(&[("market", "from_token")]);
 
         Ok(self
             .load_all_pages(request)?
@@ -406,14 +401,14 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/library/save-albums-user/
     pub fn save_album(&self, id: &str) -> Result<(), Error> {
-        let request = self.put("v1/me/albums")?.query("ids", id);
+        let request = self.put("v1/me/albums")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/library/remove-albums-user/
     pub fn unsave_album(&self, id: &str) -> Result<(), Error> {
-        let request = self.delete("v1/me/albums")?.query("ids", id);
+        let request = self.delete("v1/me/albums")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
@@ -425,7 +420,7 @@ impl WebApi {
             track: Arc<Track>,
         }
 
-        let request = self.get("v1/me/tracks")?.query("market", "from_token");
+        let request = self.get("v1/me/tracks")?.query(&[("market", "from_token")]);
 
         Ok(self
             .load_all_pages(request)?
@@ -441,7 +436,7 @@ impl WebApi {
             show: Arc<Show>,
         }
 
-        let request = self.get("v1/me/shows")?.query("market", "from_token");
+        let request = self.get("v1/me/shows")?.query(&[("market", "from_token")]);
 
         Ok(self
             .load_all_pages(request)?
@@ -452,28 +447,28 @@ impl WebApi {
 
     // https://developer.spotify.com/documentation/web-api/reference/library/save-tracks-user/
     pub fn save_track(&self, id: &str) -> Result<(), Error> {
-        let request = self.put("v1/me/tracks")?.query("ids", id);
+        let request = self.put("v1/me/tracks")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/library/remove-tracks-user/
     pub fn unsave_track(&self, id: &str) -> Result<(), Error> {
-        let request = self.delete("v1/me/tracks")?.query("ids", id);
+        let request = self.delete("v1/me/tracks")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/#/operations/save-shows-user
     pub fn save_show(&self, id: &str) -> Result<(), Error> {
-        let request = self.put("v1/me/shows")?.query("ids", id);
+        let request = self.put("v1/me/shows")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
 
     // https://developer.spotify.com/documentation/web-api/reference/#/operations/remove-shows-user
     pub fn unsave_show(&self, id: &str) -> Result<(), Error> {
-        let request = self.delete("v1/me/shows")?.query("ids", id);
+        let request = self.delete("v1/me/shows")?.query(&[("ids", id)]);
         self.send_empty_json(request)?;
         Ok(())
     }
@@ -489,9 +484,9 @@ impl WebApi {
 
         let request = self
             .get("v1/views/made-for-x")?
-            .query("types", "playlist")
-            .query("limit", "20")
-            .query("offset", "0");
+            .query(&[("types", "playlist")])
+            .query(&[("limit", "20")])
+            .query(&[("offset", "0")]);
         let result: View = self.load(request)?;
         Ok(result.content.items)
     }
@@ -508,7 +503,7 @@ impl WebApi {
 
     pub fn follow_playlist(&self, id: &str) -> Result<(), Error> {
         let request = self.put(format!("v1/playlists/{}/followers", id))?;
-        request.send_json(json!({"public": false,}))?;
+        request.json(&json!({"public": false,})).send()?;
         Ok(())
     }
 
@@ -544,8 +539,8 @@ impl WebApi {
 
         let request = self
             .get(format!("v1/playlists/{}/tracks", id))?
-            .query("marker", "from_token")
-            .query("additional_types", "track");
+            .query(&[("marker", "from_token")])
+            .query(&[("additional_types", "track")]);
         let result: Vector<PlaylistItem> = self.load_all_pages(request)?;
 
         let local_track_manager = self.local_track_manager.lock();
@@ -567,7 +562,7 @@ impl WebApi {
 
     pub fn change_playlist_details(&self, id: &str, name: &str) -> Result<(), Error> {
         let request = self.put(format!("v1/playlists/{}", id))?;
-        request.send_json(json!({ "name": name }))?;
+        request.json(&json!({ "name": name })).send()?;
         Ok(())
     }
 
@@ -575,7 +570,7 @@ impl WebApi {
     pub fn add_track_to_playlist(&self, playlist_id: &str, track_uri: &str) -> Result<(), Error> {
         let request = self
             .post(format!("v1/playlists/{}/tracks", playlist_id))?
-            .query("uris", track_uri);
+            .query(&[("uris", track_uri)]);
         self.send_empty_json(request)
     }
 
@@ -586,11 +581,12 @@ impl WebApi {
         track_uri: &str,
     ) -> Result<(), Error> {
         self.delete(format!("v1/playlists/{}/tracks", playlist_id))?
-            .send_json(ureq::json!({
+            .json(&json!({
                 "tracks": [{
                     "uri": track_uri
                 }]
-            }))?;
+            }))
+            .send()?;
 
         Ok(())
     }
@@ -617,10 +613,10 @@ impl WebApi {
         let topics = topics.iter().map(SearchTopic::as_str).join(",");
         let request = self
             .get("v1/search")?
-            .query("q", query)
-            .query("type", &topics)
-            .query("limit", &limit.to_string())
-            .query("marker", "from_token");
+            .query(&[("q", query)])
+            .query(&[("type", &topics)])
+            .query(&[("limit", &limit.to_string())])
+            .query(&[("marker", "from_token")]);
         let result: ApiSearchResults = self.load(request)?;
 
         let artists = result.artists.map_or_else(Vector::new, |page| page.items);
@@ -671,20 +667,20 @@ impl WebApi {
 
         let mut request = self
             .get("v1/recommendations")?
-            .query("marker", "from_token")
-            .query("limit", "100")
-            .query("seed_artists", &seed_artists)
-            .query("seed_tracks", &seed_tracks);
+            .query(&[("marker", "from_token")])
+            .query(&[("limit", "100")])
+            .query(&[("seed_artists", &seed_artists)])
+            .query(&[("seed_tracks", &seed_tracks)]);
 
-        fn add_range_param(mut req: Request, r: Range<impl ToString>, s: &str) -> Request {
+        fn add_range_param(mut req: RequestBuilder, r: Range<impl ToString>, s: &str) -> RequestBuilder {
             if let Some(v) = r.min {
-                req = req.query(&format!("min_{}", s), &v.to_string());
+                req = req.query(&[(format!("min_{}", s), v.to_string())]);
             }
             if let Some(v) = r.max {
-                req = req.query(&format!("max_{}", s), &v.to_string());
+                req = req.query(&[(format!("max_{}", s), v.to_string())]);
             }
             if let Some(v) = r.target {
-                req = req.query(&format!("target_{}", s), &v.to_string());
+                req = req.query(&[(format!("target_{}", s), v.to_string())]);
             }
             req
         }
@@ -726,14 +722,13 @@ impl WebApi {
     }
 
     pub fn get_image(&self, uri: Arc<str>) -> Result<ImageBuf, Error> {
-        let response = self.agent.get(&uri).call()?;
-        let format = match response.content_type() {
-            "image/jpeg" => Some(ImageFormat::Jpeg),
-            "image/png" => Some(ImageFormat::Png),
+        let response = self.http_client.get(uri.as_str()).send()?;
+        let format = match response.headers().get(reqwest::header::CONTENT_TYPE).map(|header| header.as_bytes()) {
+            Some(b"image/jpeg") => Some(ImageFormat::Jpeg),
+            Some(b"image/png") => Some(ImageFormat::Png),
             _ => None,
         };
-        let mut body = Vec::new();
-        response.into_reader().read_to_end(&mut body)?;
+        let body = response.bytes()?;
         let image = if let Some(format) = format {
             image::load_from_memory_with_format(&body, format)?
         } else {
@@ -751,8 +746,8 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<ureq::Error> for Error {
-    fn from(err: ureq::Error) -> Self {
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
         Error::WebApiError(err.to_string())
     }
 }

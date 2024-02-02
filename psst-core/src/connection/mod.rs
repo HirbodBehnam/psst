@@ -23,7 +23,7 @@ use crate::{
     error::Error,
     protocol::authentication::AuthenticationType,
     util::{
-        default_ureq_agent_builder, deserialize_protobuf, serialize_protobuf, NET_CONNECT_TIMEOUT,
+        default_reqwest_client_builder, deserialize_protobuf, serialize_protobuf, NET_CONNECT_TIMEOUT,
         NET_IO_TIMEOUT,
     },
 };
@@ -107,8 +107,8 @@ impl Transport {
             ap_list: Vec<String>,
         }
 
-        let agent = default_ureq_agent_builder(proxy_url)?.build();
-        let data: APResolveData = agent.get(AP_RESOLVE_ENDPOINT).call()?.into_json()?;
+        let http_proxy = default_reqwest_client_builder(proxy_url)?.build()?;
+        let data: APResolveData = http_proxy.get(AP_RESOLVE_ENDPOINT).send()?.json()?;
         data.ap_list
             .into_iter()
             .next()
@@ -151,7 +151,7 @@ impl Transport {
 
     fn stream_through_proxy(ap: &str, url: &str) -> Result<TcpStream, Error> {
         match Url::parse(url) {
-            Ok(url) if url.scheme() == "socks" || url.scheme() == "socks5" => {
+            Ok(url) if url.scheme() == "socks" || url.scheme() == "socks5" || url.scheme() == "socks5h" => {
                 // Currently we only support SOCKS5 proxies.
                 Self::stream_through_socks5_proxy(ap, &url)
             }

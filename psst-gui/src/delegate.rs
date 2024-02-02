@@ -23,7 +23,7 @@ pub struct Delegate {
 
 impl Delegate {
     pub fn new() -> Self {
-        const MAX_IMAGE_THREADS: usize = 32;
+        const MAX_IMAGE_THREADS: usize = 4;
 
         Self {
             main_window: None,
